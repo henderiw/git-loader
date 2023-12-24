@@ -1,0 +1,8 @@
+apiVersion: inv.sdcio.dev/v1alpha1
+kind: Schema
+metadata:
+  name: sros.nokia.sdcio.dev-23.10.1
+  namespace: default
+spec:
+  repoURL: https://github.com/nephio-project/nephio-example-packages
+  
