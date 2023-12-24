@@ -6,7 +6,6 @@
 *.dylib
 bin
 vendor
-config
 build
 *.kformpkg
 .kform
