@@ -1,14 +1,4 @@
-package git
-
-import (
-	"context"
-	"fmt"
-
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
-	"github.com/henderiw/logger/log"
-	"go.opentelemetry.io/otel/trace"
-)
+package pkg
 
 /*
 // LoadOptions holds the configuration for walking a git tree
@@ -48,8 +38,7 @@ type fileListEntry struct {
 }
 */
 
-type ListFunc func(ctx context.Context, tree *object.Tree) error
-
+/*
 func (r *gitRepository) List(ctx context.Context, ref string, listFn ListFunc) error {
 	ctx, span := tracer.Start(ctx, "gitRepository::List", trace.WithAttributes())
 	defer span.End()
@@ -57,80 +46,21 @@ func (r *gitRepository) List(ctx context.Context, ref string, listFn ListFunc) e
 	defer r.mu.Unlock()
 
 	log := log.FromContext(ctx)
-	var err error
-	var commit *object.Commit
-	if r.branchNotTag {
-		commit, err = r.getCommitFromBranch(ctx, plumbing.ReferenceName(branchPrefixInLocalRepo+ref))
-		if err != nil {
-			return err
-		}
-	} else {
-		commit, err = r.getCommitFromTag(ctx, plumbing.ReferenceName(tagsPrefixInLocalRepo+ref))
-		if err != nil {
-			return err
-		}
-	}
-	tree, err := r.getRootTree(ctx, commit)
+	// getCommit
+	commit, err := r.getCommit(ctx, RefName(ref))
 	if err != nil {
-		if err == object.ErrDirectoryNotFound {
-			log.Info("could not find directory prefix in commit", "path", r.directory, "commit", commit.Hash.String())
-			return nil
-		} else {
-			return err
-		}
+		return err
 	}
-	if listFn != nil {
-		return listFn(ctx, tree)
-	}
-	/*
-		fileList, err := r.load(ctx, commit, opts)
-		if err != nil {
-			return err
-		}
-		for fileName := range fileList.files {
-			fmt.Println("fileName", fileName)
 
-		}
-	*/
+	fileList, err := r.load(ctx, commit, opts)
+	if err != nil {
+		return err
+	}
+	for fileName := range fileList.files {
+		fmt.Println("fileName", fileName)
+
+	}
 	return nil
-}
-
-func (r *gitRepository) getCommitFromBranch(ctx context.Context, refname plumbing.ReferenceName) (*object.Commit, error) {
-	ref, err := r.repo.Reference(refname, false)
-	if err != nil {
-		return nil, err
-	}
-	return r.repo.CommitObject(ref.Hash())
-}
-
-func (r *gitRepository) getCommitFromTag(ctx context.Context, refname plumbing.ReferenceName) (*object.Commit, error) {
-	ref, err := r.repo.Reference(refname, false)
-	if err != nil {
-		return nil, err
-	}
-	tag, err := r.repo.TagObject(ref.Hash())
-	if err != nil {
-		return nil, err
-	}
-
-	return tag.Commit()
-}
-
-func (r *gitRepository) getRootTree(ctx context.Context, commit *object.Commit) (*object.Tree, error) {
-	//log := log.FromContext(ctx)
-	rootTree, err := commit.Tree()
-	if err != nil {
-		return nil, fmt.Errorf("cannot resolve commit %v to tree (corrupted repository?): %w", commit.Hash, err)
-	}
-
-	if r.directory != "" {
-		tree, err := rootTree.Tree(r.directory)
-		if err != nil {
-			return nil, err
-		}
-		rootTree = tree
-	}
-	return rootTree, nil
 }
 
 /*

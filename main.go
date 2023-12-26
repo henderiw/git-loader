@@ -9,11 +9,9 @@ import (
 
 	repov1alpha1 "github.com/henderiw/git-loader/apis/config/v1alpha1"
 	invv1alpha1 "github.com/henderiw/git-loader/apis/inv/v1alpha1"
+	"github.com/henderiw/git-loader/pkg/auth/token"
 	"github.com/henderiw/git-loader/pkg/git"
-	"github.com/henderiw/git-loader/pkg/git/schema"
 	"github.com/henderiw/logger/log"
-	"github.com/iptecharch/schema-server/config"
-	sschema "github.com/iptecharch/schema-server/schema"
 	"sigs.k8s.io/yaml"
 )
 
@@ -76,77 +74,81 @@ func runCmd(ctx context.Context) error {
 		Directory: dirpath,
 	}
 
-	gitRepo, err := git.OpenRepository(ctx, rootGitPath, gitSpec)
+	resolverChain := []token.Resolver{
+		token.NewTokenResolver(),
+	}
+
+	gitRepo, err := git.OpenRepository(ctx, rootGitPath, gitSpec, &git.Options{
+		CredentialResolver: token.NewCredentialResolver(resolverChain),
+	})
 	if err != nil {
 		return err
 	}
 
-	if len(cr.Spec.Schema.Models) != 0 {
-		schema := schema.Schema{
-			RootPath: rootPath,
-			CR:       cr,
-		}
-		providerPath := cr.Spec.GetBasePath(rootPath)
-		if _, err := os.Stat(cr.Spec.GetBasePath(rootPath)); err != nil {
-			if err := os.MkdirAll(providerPath, 0766); err != nil {
-				return err
-			}
-			if err := gitRepo.List(ctx, gitSpec.Ref, schema.Copy); err != nil {
-				return err
-			}
-		}
-
-		if _, err := sschema.NewSchema(&config.SchemaConfig{
-			Name:        cr.Name,
-			Vendor:      cr.Spec.Provider,
-			Version:     cr.Spec.Version,
-			Files:       cr.Spec.GetNewSchemaBase(rootPath).Models,
-			Directories: cr.Spec.GetNewSchemaBase(rootPath).Includes,
-			Excludes:    cr.Spec.GetNewSchemaBase(rootPath).Excludes,
-		}); err != nil {
-			return err
-		}
+	if err := gitRepo.Commit(ctx,
+		"refs/remotes/origin/test-package/test-workspace",
+		"test-package",
+		"test-workspace",
+		"v1",
+		map[string]string{
+			"a.txt": "content-a",
+			"a/b.txt":   "content-b",
+			"a/b/c.txt": "content-c",
+		},
+	); err != nil {
+		return err
 	}
+
+	if err := gitRepo.Push(ctx, "refs/remotes/origin/test-package/test-workspace"); err != nil {
+		return err
+	}
+
+	if err := gitRepo.Commit(ctx,
+		"refs/remotes/origin/test-package/test-workspace",
+		"test-package",
+		"test-workspace",
+		"v1",
+		map[string]string{
+			"a.txt": "content-anew",
+			"a/b.txt":   "content-bnew",
+			"a/b/c.txt": "content-cnew",
+		},
+	); err != nil {
+		return err
+	}
+
+	if err := gitRepo.Push(ctx, "refs/remotes/origin/test-package/test-workspace"); err != nil {
+		return err
+	}
+
+	/*
+		if len(cr.Spec.Schema.Models) != 0 {
+			schema := schema.Schema{
+				RootPath: rootPath,
+				CR:       cr,
+			}
+			providerPath := cr.Spec.GetBasePath(rootPath)
+			if _, err := os.Stat(cr.Spec.GetBasePath(rootPath)); err != nil {
+				if err := os.MkdirAll(providerPath, 0766); err != nil {
+					return err
+				}
+				if err := gitRepo.List(ctx, gitSpec.Ref, schema.Copy); err != nil {
+					return err
+				}
+			}
+
+			if _, err := sschema.NewSchema(&config.SchemaConfig{
+				Name:        cr.Name,
+				Vendor:      cr.Spec.Provider,
+				Version:     cr.Spec.Version,
+				Files:       cr.Spec.GetNewSchemaBase(rootPath).Models,
+				Directories: cr.Spec.GetNewSchemaBase(rootPath).Includes,
+				Excludes:    cr.Spec.GetNewSchemaBase(rootPath).Excludes,
+			}); err != nil {
+				return err
+			}
+		}
+	*/
 
 	return nil
 }
-
-/*
- git.LoadOptions{
-		FilterPrefix: cr.Spec.Git.Directory,
-		Recurse: true,
-	}
-*/
-
-// options
-// Copy files
-// Get package
-// Load Files
-
-/*
-  dirs:
-  - src: YANG
-    dst: .
-  schema:
-    models:
-    - nokia-combined
-    includes:
-    - ietf
-    - nokia-sros-yang-extensions.yang
-    excludes: []
-*/
-
-/*
-  dirs:
-  - src: srlinux-yang-models
-    dst: .
-  schema:
-    models:
-    - srl_nokia/models
-    includes:
-    - ietf
-    - openconfig/extensions
-    - openconfig/openconfig-extensions.yang
-    excludes:
-    - .*tools.*
-*/

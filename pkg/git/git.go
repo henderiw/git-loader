@@ -10,8 +10,11 @@ import (
 	"sync"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	configv1alpha1 "github.com/henderiw/git-loader/apis/config/v1alpha1"
+	"github.com/henderiw/git-loader/pkg/auth"
 	"github.com/henderiw/logger/log"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
@@ -21,20 +24,32 @@ var tracer = otel.Tracer("git")
 
 type GitRepository interface {
 	List(ctx context.Context, ref string, listFn ListFunc) error
+	Commit(ctx context.Context, ref, packageName, workspaceName, revision string, resources map[string]string) error
+	Push(ctx context.Context, ref string) error
 }
 
 type gitRepository struct {
-	url          string
-	secret       string  // Secret containing Credentials
-	ref          RefName // The main branch from repository registration (defaults to 'main' if unspecified)
-	directory    string
-	repo         *git.Repository
-	branchNotTag bool // is either a branch or a tag -> dynamically discovered based on the tag we get from the repoCfg
+	url                string
+	secret             string  // Secret containing Credentials
+	ref                RefName // The main branch from repository registration (defaults to 'main' if unspecified)
+	directory          string
+	repo               *git.Repository
+	credentialResolver auth.CredentialResolver
+	userInfoProvider   auth.UserInfoProvider
+
+	// credential contains the information needed to authenticate against
+	// a git repository.
+	credential auth.Credential
 
 	mu sync.Mutex
 }
 
-func OpenRepository(ctx context.Context, root string, repoCfg *configv1alpha1.GitRepository) (GitRepository, error) {
+type Options struct {
+	CredentialResolver auth.CredentialResolver
+	UserInfoProvider   auth.UserInfoProvider
+}
+
+func OpenRepository(ctx context.Context, root string, repoCfg *configv1alpha1.GitRepository, opts *Options) (GitRepository, error) {
 	ctx, span := tracer.Start(ctx, "OpenRepository", trace.WithAttributes())
 	defer span.End()
 
@@ -87,20 +102,20 @@ func OpenRepository(ctx context.Context, root string, repoCfg *configv1alpha1.Gi
 	}
 
 	repository := &gitRepository{
-		url:       repoCfg.URL,
-		secret:    repoCfg.Credentials,
-		ref:       ref,
-		directory: strings.Trim(repoCfg.Directory, "/"),
-		repo:      repo,
-		//credentialResolver: opts.CredentialResolver,
-		//userInfoProvider:   opts.UserInfoProvider,
+		url:                repoCfg.URL,
+		secret:             repoCfg.Credentials,
+		ref:                ref,
+		directory:          strings.Trim(repoCfg.Directory, "/"),
+		repo:               repo,
+		credentialResolver: opts.CredentialResolver,
+		userInfoProvider:   opts.UserInfoProvider,
 	}
 
 	if err := repository.fetchRemoteRepository(ctx); err != nil {
 		return nil, err
 	}
 
-	if err := repository.verifyRepository(ctx); err != nil {
+	if _, err := repository.verifyRef(ctx, ref); err != nil {
 		return nil, err
 	}
 
@@ -131,19 +146,6 @@ func (r *gitRepository) fetchRemoteRepository(ctx context.Context) error {
 	return nil
 }
 
-// Verifies repository. Repository must be fetched already.
-func (r *gitRepository) verifyRepository(ctx context.Context) error {
-	if _, err := r.repo.Reference(r.ref.RefInLocal(), false); err == nil {
-		r.branchNotTag = true
-		return nil
-	}
-	if _, err := r.repo.Reference(r.ref.TagInLocal(), false); err == nil {
-		r.branchNotTag = false // this is a tag
-		return nil
-	}
-	return fmt.Errorf("no branches/tags found for this ref %q", r.ref)
-}
-
 // doGitWithAuth fetches auth information for git and provides it
 // to the provided function which performs the operation against a git repo.
 func (r *gitRepository) doGitWithAuth(ctx context.Context, op func(transport.AuthMethod) error) error {
@@ -172,20 +174,114 @@ func (r *gitRepository) doGitWithAuth(ctx context.Context, op func(transport.Aut
 // credentials between calls and refresh credentials when the tokens have expired.
 func (r *gitRepository) getAuthMethod(ctx context.Context, forceRefresh bool) (transport.AuthMethod, error) {
 	// If no secret is provided, we try without any auth.
-	if r.secret == "" {
-		return nil, nil
+	/*
+		if r.secret == "" {
+			return nil, nil
+		}
+	*/
+
+	if r.credential == nil || !r.credential.Valid() || forceRefresh {
+		if cred, err := r.credentialResolver.ResolveCredential(ctx, "", ""); err != nil {
+			return nil, fmt.Errorf("failed to obtain credential from secret %s/%s: %w", "", "", err)
+		} else {
+			r.credential = cred
+		}
 	}
 
-	/*
-		if r.credential == nil || !r.credential.Valid() || forceRefresh {
-			if cred, err := r.credentialResolver.ResolveCredential(ctx, r.namespace, r.secret); err != nil {
-				return nil, fmt.Errorf("failed to obtain credential from secret %s/%s: %w", r.namespace, r.secret, err)
-			} else {
-				r.credential = cred
-			}
-		}
+	return r.credential.ToAuthMethod(), nil
+}
 
-		return r.credential.ToAuthMethod(), nil
-	*/
-	return nil, nil
+func (r *gitRepository) getCommit(ctx context.Context, ref RefName) (*object.Commit, error) {
+	var err error
+	var commit *object.Commit
+
+	// verify if the ref is in the repository and if the ref is a branch or a tag
+	// since the commit hash lookup is different depending if it is a branch or a tag
+	branch, err := r.verifyRef(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	if branch {
+		commit, err = r.getCommitFromBranch(ctx, plumbing.ReferenceName(branchPrefixInLocalRepo+string(ref)))
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		commit, err = r.getCommitFromTag(ctx, plumbing.ReferenceName(tagsPrefixInLocalRepo+string(ref)))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return commit, nil
+}
+
+// Verifies reference in the repository and returns true if it is a branch and false
+// if it is a tag or an error if not found
+func (r *gitRepository) verifyRef(ctx context.Context, ref RefName) (bool, error) {
+	if _, err := r.repo.Reference(ref.RefInLocal(), false); err == nil {
+		return true, nil
+	}
+	if _, err := r.repo.Reference(ref.TagInLocal(), false); err == nil {
+		return false, nil
+	}
+	return false, fmt.Errorf("no branches/tags found for this ref %q", ref)
+}
+
+func (r *gitRepository) getCommitFromBranch(ctx context.Context, refname plumbing.ReferenceName) (*object.Commit, error) {
+	ref, err := r.repo.Reference(refname, false)
+	if err != nil {
+		return nil, err
+	}
+	return r.repo.CommitObject(ref.Hash())
+}
+
+func (r *gitRepository) getCommitFromTag(ctx context.Context, refname plumbing.ReferenceName) (*object.Commit, error) {
+	ref, err := r.repo.Reference(refname, false)
+	if err != nil {
+		return nil, err
+	}
+	tag, err := r.repo.TagObject(ref.Hash())
+	if err != nil {
+		return nil, err
+	}
+
+	return tag.Commit()
+}
+
+func (r *gitRepository) getRootTree(ctx context.Context, commit *object.Commit) (*object.Tree, error) {
+	//log := log.FromContext(ctx)
+	rootTree, err := commit.Tree()
+	if err != nil {
+		return nil, fmt.Errorf("cannot resolve commit %v to tree (corrupted repository?): %w", commit.Hash, err)
+	}
+
+	if r.directory != "" {
+		tree, err := rootTree.Tree(r.directory)
+		if err != nil {
+			return nil, err
+		}
+		rootTree = tree
+	}
+	return rootTree, nil
+}
+
+// pushes the local reference to the remote repository
+func (r *gitRepository) pushAndCleanup(ctx context.Context, ph *pushRefSpecBuilder) error {
+	specs, require, err := ph.BuildRefSpecs()
+	if err != nil {
+		return err
+	}
+
+	if err := r.doGitWithAuth(ctx, func(auth transport.AuthMethod) error {
+		return r.repo.Push(&git.PushOptions{
+			RemoteName:        OriginName, // origin
+			RefSpecs:          specs, // e.g. [d48aaa68deca311768be2bb5dd0cd97b8da13971:refs/heads/test-package/test-workspace]
+			Auth:              auth,
+			RequireRemoteRefs: require, // empty for push
+			Force: true,
+		})
+	}); err != nil {
+		return err
+	}
+	return nil
 }
